@@ -1,0 +1,786 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% This code shows a 2D spring-damper system (MSD) simulation subject to an 
+% external forces to simulate a framework that integrates force sensing 
+% systems and variable impedance control to learn force-based variable 
+% stiffness skills. Such skills rely on an estimation of the stiffness 
+% that is computed from the human demonstrations, which is then used along 
+% with the sensed forces to encode a probabilistic model of the task.
+%
+% The resulting model is then used to retrieve a time-varying stiffness 
+% profile by Gaussian mixture regression.
+% 
+% Two different stiffness representations, namely: 
+%  (i)  a vectorized version of the Cholesky decomposition of the stiffness
+%       matrix, and 
+%  (ii) a manifold-based encoding that exploits positive semi-definiteness
+%       properties of stiffness matrices.
+%
+% This code used sliding window for data selection for stiffness estimation
+% 
+% For least square estimation and SPD approximation it is possible to use:
+%  (i)  Nearest SPD approximation based on N. J. Higham, 1988.
+%  (ii) Convex optimzation
+%       CVX Matlab toolbox http://cvxr.com/cvx/
+%
+% Writing code takes time. Polishing it and making it available to others 
+% takes longer! If some parts of the code were useful for your research of 
+% for a better understanding of the algorithms, please reward the authors 
+% by citing the related publications, and consider making your own research
+% available in this way.
+%
+% @article{abudakka2018force,
+% 	title={Force-based variable impedance learning for robotic 
+%          manipulation},
+%   author={Abu-Dakka, Fares J and Rozo, Leonel and Caldwell, Darwin G},
+%   journal={Robotics and Autonomous Systems},
+%   volume={109},
+%   pages={156--167},
+%   year={2018}
+% }
+%
+% Copyright (c) 2017-18 Fares J. Abu-Dakka
+%
+% This program is free software: you can redistribute it and/or modify
+% it under the terms of the GNU General Public License as published by
+% the Free Software Foundation, either version 3 of the License, or
+% (at your option) any later version.
+% 
+% This program is distributed in the hope that it will be useful,
+% but WITHOUT ANY WARRANTY; without even the implied warranty of
+% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+% GNU General Public License for more details.
+% 
+% You should have received a copy of the GNU General Public License
+% along with this program.  If not, see <https://www.gnu.org/licenses/>.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+close all;
+clear all
+clc
+
+%% Load demonstrations and define paths
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+dataPath  = 'data/'; % Data path
+load([dataPath 'data_01.mat']);
+addpath(genpath('F:\RICA\metaheuristic-manifold-optimization-main (1)\metaheuristic-manifold-optimization-main\manifolds'));
+addpath(genpath('F:\RICA\metaheuristic-manifold-optimization-main (1)\metaheuristic-manifold-optimization-main\gmm_gmr'));
+
+%% Problem parameters
+windowSize   = 3;           % sliding window size
+convexOptim  = 0;           % Do CVX for stiffness estimations
+spdApproxim  = 0;           % Do nearestSPD for stiffness estimations
+ricaOptim    = 0;           % Do RICA for stiffness estimations (Requires Manopt and rica_solver_v_2)
+mDTMAoptim   = 1;           % Do mDTMA for stiffness estimations (NEW)
+
+% GMM parameters on CHOLesky decomposition
+modelCHOL.nbStates  = 6;    % Number of Gaussians in CHOL model
+modelCHOL.dt        = 0.02; % Time step
+modelCHOL.nbSamples = 5;    % Number of demonstrations
+reprosCHOL          = 6:8;    % reproduction
+time                = modelCHOL.dt:modelCHOL.dt:2;
+% Regularization of covariance
+modelCHOL.params_diagRegFact = 1E-4;
+
+% GMM parametes on SPD manifolds
+modelPD.nbStates    = 6;    % Number of Gaussians in SPD manifold model
+modelPD.nbVar       = 5;    % Dimension of the manifold and tangent space 
+                            % (1D input + 2^2 output)
+modelPD.dt          = 2E-2; % Time step duration
+modelPD.Kp          = 120;  % Gain for position control in task space
+modelPD.nbIter      = 10;   % Number of iteration for the Gaussian Newton 
+                            % algorithm (Riemannian manifold)
+modelPD.nbSamples   = 5;    % Number of demonstrations
+modelPD.nbIterEM    = 10;   % Number of iteration for the EM algorithm
+reprosMan           = reprosCHOL;   % reproduction
+% Dimension of the output covariance
+modelPD.nbVarCovOut = modelPD.nbVar + modelPD.nbVar*(modelPD.nbVar-1)/2; 
+% Regularization of covariance
+modelPD.params_diagRegFact = 1E-4;
+
+%% Colors
+clrmapCHOL_states = lines(modelCHOL.nbStates);
+clrmapMAN_states = lines(modelPD.nbStates);
+clrmap_demos = lines(modelCHOL.nbSamples);
+clrmap_summer = summer(max([length(reprosCHOL) length(reprosMan)]));
+
+%% Indexes 
+demons    = 1:10;                   % Demonstrations to train the model
+n_s_total = length(dD);             % total no. of springs
+n_s       = modelCHOL.nbSamples;	% no. of springs
+
+% Ids
+posId = (1:2);      velId = (3:4);      accId = (5:6);
+
+%remove datapoints from the estimation
+rdp = 2;
+
+DAMPING = 1;            % damping
+if (DAMPING),    D = 50;    else,    D = 0;     end
+
+LOAD_TOY_EX_DATA = 0;
+if LOAD_TOY_EX_DATA
+    load([dataPath 'toyExampleMSDstiffnessLearning.mat']);
+end
+%% Compute average forces
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+for j=1:n_s_total
+    sumF = 0; 
+    for n = demons
+        dD(j).nbData = nbData;
+        sumF = sumF + dD(j).demo(n).DataF(:,:);
+    end
+    % calculating average forces for each spring
+    dD(j).avgFe = sumF/n;
+end
+
+%% Stiffness estimation and data creation for learning
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+if ~LOAD_TOY_EX_DATA
+    ww = diag(ones(2,1)*0.000);             % Least squares regularization
+    % Matrix storing for GMM over SPD manifold
+    % $\bm{\Xi}=
+    %  \begin{pmatrix}
+    %    \text{diag}(t,\mathbf{f}_{avg}^e)	&	\bm{0}	\\
+    %    \bm{0}                             &	\mathbf{\tilde{K}}^\mathcal{P}
+    %  \end{pmatrix} $
+    xIn(1,:) = (1:nbData-rdp) * modelPD.dt; % Time as input variable
+    X = zeros(modelPD.nbVar,modelPD.nbVar,(nbData-rdp)*modelPD.nbSamples);
+    X(1,1,:) = reshape(repmat(xIn,1,modelPD.nbSamples),1,1,(nbData-rdp)...
+        *modelPD.nbSamples); % Stores input
+    eeigU = zeros(2,nbData,n_s_total);
+    eigVal = zeros(2,nbData,n_s_total);
+    for j=1:n_s_total
+        fprintf('Stiffness matrices estimation...\n');
+        g = dD(j).xR1;  % Goal, here it is the rest position of the spring
+        tt1 = 1;    tt2 = windowSize;
+        %%%%%%%%%%%%%%%%%%% Preparing X and Y in Eq. (3) %%%%%%%%%%%%%%%%%%%%%%
+        for n = demons
+            auxX = [];
+            for i = 1 : nbData
+                if i+windowSize-1 <=nbData
+                    % $\{\tilde{\bm{x}} = \hat{\bm{x}} - \bm{x}\}_t$
+                    auxX(:,:) = repmat(g, 1, windowSize) - ...
+                        dD(j).demo(n).DataP(posId,i:i+windowSize-1);
+                    
+                    % $\{\tilde{\bm{y}} = \bm{I}_M\ddot{\bm{x}} + 
+                    % \bm{K}^\mathcal{V} \dot{\bm{x}} - \bm{f}^e\}_t$
+                    auxY(:,:) = dD(j).demo(n).DataP(accId,i:i+windowSize-1) + ...
+                        D*dD(j).demo(n).DataP(velId,i:i+windowSize-1) - dD(j).demo(n).DataF(:,i:i+windowSize-1);
+                else
+                    auxX(:,:) = repmat(g, 1, windowSize) - ...
+                        [dD(j).demo(n).DataP(posId,i:end), ...
+                        repmat(dD(j).demo(n).DataP(posId,end), 1, ...
+                        abs(nbData-i-windowSize+1))];
+                    auxY(:,:) = [dD(j).demo(n).DataP(accId,i:end), ...
+                        repmat(dD(j).demo(n).DataP(accId,end), 1, ...
+                        abs(nbData-i-windowSize+1))] + ...
+                        [dD(j).demo(n).DataP(velId,i:end), ...
+                        repmat(dD(j).demo(n).DataP(velId,end), 1, ...
+                        abs(nbData-i-windowSize+1))] * D - ...
+                        [dD(j).demo(n).DataF(:,i:end), ...
+                        repmat(dD(j).demo(n).DataF(:,end), 1, ...
+                        abs(nbData-i-windowSize+1))];
+                end
+                % ${\bm{X} = \tilde{\bm{x}}_1\Arrowvert\tilde{\bm{x}}_2
+                % \Arrowvert\dots\Arrowvert\tilde{\bm{x}}_k}$
+                dD(j).xX(tt1:tt2,:,i) = auxX(:,:)';
+                
+                % ${\bm{Y} = \tilde{\bm{y}}_1\Arrowvert\tilde{\bm{y}}_2
+                % \Arrowvert\dots\Arrowvert\tilde{\bm{y}}_k}$
+                dD(j).yY(tt1:tt2,:,i) = auxY(:,:)';
+            end
+            tt1 = size(dD(j).xX(:,:,1),1)+1;
+            tt2 = size(dD(j).xX(:,:,1),1) + windowSize;
+        end
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        for i = 1 : nbData
+            
+            XtX = dD(j).xX(:,:,i)' * dD(j).xX(:,:,i);
+            XtY = dD(j).xX(:,:,i)' * dD(j).yY(:,:,i);
+            % Always compute the basic least squares estimate
+            % Always compute the basic least squares estimate first
+            Korig = (XtX + ww) \ XtY;
+            eeigU(:,i,j) = eig(Korig);
+            
+            % Store original values
+            dD(j).KPorig11(i) = Korig(1,1);
+            dD(j).KPorig22(i) = Korig(2,2);
+            
+            % Apply selected refinement method
+            if (spdApproxim)
+                K = nearestSPD(Korig);      
+            elseif (convexOptim)
+                % Convex optimization
+                d = length(posId);
+                cvx_begin sdp
+                variable Kcvx(d,d) symmetric;
+                minimize( norm(XtX * Kcvx - XtY, 2));
+                Kcvx >= eye(d);
+                cvx_end
+                KpCVX(:,:,i,j) = Kcvx;      
+                K = Kcvx;
+            elseif (ricaOptim)
+                % RICA-based stiffness estimation
+                cost_func = @(K_mat) norm(XtX * K_mat - XtY, 2)^2;
+                M = sympositivedefinitefactory(2);
+                rica_opts = struct(...
+                'num_countries', 50, ...
+                'num_imperialists', 5, ...
+                'num_iterations', 100, ...
+                'assimilation_coef', 0.3, ...
+                'revolution_rate', 0.4, ...
+                'verbosity', 0);
+                rica_opts.empire_assignment = 'roulette';  
+    
+                rica_opts.empire_competition = 'probabilistic';  
+            
+                rica_opts.colony_update = 'stochastic';  
+                [K_rica, ~, ~] = rica_solver_v_2(M, cost_func, rica_opts);
+                K = K_rica;
+                dD(j).KP_rica(:,:,i) = K;
+            elseif (mDTMAoptim)  % NEW mDTMA OPTION
+                % mDTMA-based stiffness estimation on SPD manifold
+                problem.M = sympositivedefinitefactory(2);
+                problem.cost = @(K_mat) norm(XtX * K_mat - XtY, 2)^2;
+                
+                % mDTMA parameters
+                pn = 50;        % Population size
+                itmax = 100;    % Maximum iterations
+                w0 = 0.4;       % Initial step size parameter
+                
+                % Run mDTMA optimization
+                [K_mdtma, fbest, info] = pso(problem, pn, itmax);
+                
+                K = K_mdtma;
+                dD(j).KP_mdtma(:,:,i) = K;
+            else
+                % Use the raw least squares estimate
+                K = Korig;
+            end
+            % Eigen decomposition if necessary
+            % $\bm{\tilde{K}}^\mathcal{P} = \bm{\mathcal{Q}}\bm{\Lambda}
+            % \bm{\mathcal{Q}}^{-1}$
+            [vec,val] = eig(K);
+            if(val(1,1) < 1E-4),  val(1,1) = 1E-4;   K = vec*val*vec';  end
+            if(val(2,2) < 1E-4),  val(2,2) = 1E-4;   K = vec*val*vec';  end
+            
+            % compute uper triangle Cholesky decomomposition
+            [Kp,p] = chol(K);
+            
+            % If Cholesky fails, compute Cholesky covariance.
+            if p > 0
+                [Kp,pp] = cholcov(K);
+            end
+            
+            eigVec{j}(:,:,i) = vec;     eigVal(:,i,j) = [val(1,1); val(2,2)];
+            Kpt = zeros(3,1);	Kpt(1) = Kp(1,1);   Kpt(2) = Kp(1,2);
+            
+            % Vectorizing Cholesky factor
+            [mm,nn] = size(Kp);
+            if mm==2 && nn==2   Kpt(3) = Kp(2,2);                   end
+            if mm==1 && nn==2   Kp(2,1) = 0;        Kp(2,2) = 0;    end
+            
+            dD(j).Kpt(:,i) = Kpt;           % Cholesky vector
+            dD(j).KP(:,:,i) = K;            % Stiffness matrix
+            dD(j).KPXX(i) = K(1,1);
+            dD(j).KPYY(i) = K(2,2);
+            dD(j).KPXY(i) = K(1,2);
+            dD(j).KPorig11(i) = Korig(1,1);
+            dD(j).KPorig22(i) = Korig(2,2);
+            dD(j).Kp(:,:,i) = Kp;           % Cholesky factor
+            
+            % Original stiffness of the spring
+            dD(j).KO(:,:,i) = [
+                dD(j).KXX(i),    dD(j).KXY(i);
+            	dD(j).KYX(i),    dD(j).KYY(i)];
+            
+            % creating training data for GMM from first nbSamples springs
+            if (j<=modelCHOL.nbSamples && i>rdp)
+                X(4:5,4:5,i-rdp+(j-1)*(nbData-rdp)) = K;
+                X(2:3,2:3,i-rdp+(j-1)*(nbData-rdp))=diag(dD(j).avgFe(:,i));
+                
+                dD(j).Data(2:3,i-rdp+(nbData-rdp)*(j-1))= dD(j).avgFe(:,i);
+                dD(j).Data(4:6,i-rdp+(nbData-rdp)*(j-1))= Kpt;
+                
+                DataK(2:3,i-rdp+(nbData-rdp)*(j-1)) = dD(j).avgFe(:,i);
+                DataK(4:6,i-rdp+(nbData-rdp)*(j-1)) = Kpt;
+            end
+        end
+        if (j<=5)
+            DataK(1,(nbData-rdp)*(j-1)+1:i-rdp+(nbData-rdp)*(j-1)) ...
+                = time(1:(nbData-rdp));
+            dD(j).Data(1,(nbData-rdp)*(j-1)+1:i-rdp+(nbData-rdp)*(j-1)) ...
+                = time(1:(nbData-rdp));
+        end
+    end
+end
+%% Computing the trajectory of the mass from the estimated stiff.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+reproduction=figure('position',[1000,500,500,200]);hold on;
+title('\fontsize{10}Cartesian trajectory of different MSD');
+for j=1:n_s
+    m1=1;dt=0.02;xr=[];
+    %for n=1:5
+    %    plot(dD(j).demo(n).DataP(1,:),dD(j).demo(n).DataP(2,:));
+    %    xr = [xr dD(j).demo(n).DataP(posId,end)];
+    %end
+    xR1  = g;                   % Rest and goal position of the mass 1 (c)
+    x1(:,1)   = xR1;            % Initial position for the mass 1
+    dx1(:,1)  = zeros(2,1);     % Initial velocity for the mass 1
+    ddx1(:,1) = zeros(2,1);     % Initial acceleration for the mass 1
+    f1 = zeros(2,1);
+    Fe = dD(j).avgFe;
+    for i = 2 : nbData
+        % Stiffness matrices $K_t$ estimated from least squares.
+        k1 = dD(j).KP(:,:,i);
+        % Solving the system, 1st the acceleration of the mass is computed
+%         f1(:,i-1) = k1 * ( xR1 - x1(:,i-1) );
+        f1(:,i-1) = k1 * ( x1(:,i-1) - xR1 );
+%         ddx1(:,i) = (Fe(:,i-1) + f1(:,i-1) - D * dx1(:,i-1)) / m1;
+        ddx1(:,i) = (Fe(:,i-1) - f1(:,i-1) - D * dx1(:,i-1)) / m1;
+        % Euler integration
+        % Finding the velocity for the mass
+        dx1(:,i)  = dx1(:,i-1) + ddx1(:,i) * dt;
+        % Computing the position
+        x1(:,i) = x1(:,i-1) + dx1(:,i) * dt;
+    end
+    n=1;
+    for i = round(linspace(2,nbData-2,30))
+        x1x(:,n) = x1(:,i);
+        n = n+1;
+    end
+    plot(x1(1,:),x1(2,:));
+    %plot(x1x(1,:),x1x(2,:),'.b');
+end
+xlabel('$x$','interpreter','latex');
+ylabel('$y$','interpreter','latex');
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+
+%% Learning: GMM on CHOLesky decomposition
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+if ~LOAD_TOY_EX_DATA
+    tic;
+    % GMM initialization and training the data with an expectation-maximization
+    % Eq. (5)
+    modelCHOL = init_GMM_kbins(DataK(:,:), modelCHOL, modelCHOL.nbSamples);
+    modelCHOL = EM_GMM(DataK(:,:), modelCHOL);
+    elapsed_t_CHOL(1) = toc;
+    
+    model_r = modelCHOL;
+end
+%% Plotting results from GMM on CHOLesky decomposition
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting Demonstrated Stiffness
+handel_GMM_GMR_CHOL = figure('position',[1000,500,600,450]); hold on;
+htt = subplot(4,2,1:2); hold on; 
+t1 = title('\fontsize{10}GMM/GMR based on Cholesky decomposition');
+set(htt(1), 'position', [0.1300 0.95,0.7750, .0] );
+htt.Visible = 'off';t1.Visible = 'on';
+
+subplot(3,2,1); hold on;
+title('\fontsize{10}Demonstrated Stiffness');
+for n=1:modelCHOL.nbSamples
+    for i=round(linspace(1,(nbData-rdp),10))
+        plotGMM2([i;0], X(4:5,4:5,i+(n-1)*(nbData-rdp)), clrmap_demos(n,:), .4);
+    end
+end
+xlim([-27, (nbData-rdp)+10]); ylim([-27, 27]);
+ylabel('$\mathbf{K}^p$', 'Interpreter', 'Latex', 'Fontsize', 10);
+xlabel('$t$', 'Fontsize', 10, 'Interpreter', 'Latex');
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting GMM centers on CHOL
+subplot(3,2,2); hold on;
+title('\fontsize{10}GMM centers on CHOL');
+for i=1:modelCHOL.nbStates
+    Mu(:,:,i) = zeros(2,2);             Mu(1,1,i) = modelCHOL.Mu(4,i);
+    Mu(1,2,i) = modelCHOL.Mu(5,i);      Mu(2,2,i) = modelCHOL.Mu(6,i);
+    Mu(:,:,i) = Mu(:,:,i)' * Mu(:,:,i);    
+    [h, ~] = plotGMM2([0; 0], Mu(:,:,i), clrmapMAN_states(i,:), .3); 
+    hh{i} = h(1);
+end
+for i=round(linspace(nbData,2*nbData,20))
+    Mu(:,:,i) = zeros(2,2);             Mu(1,1,i) = DataK(4,i);
+    Mu(1,2,i) = DataK(5,i);             Mu(2,2,i) = DataK(6,i);
+    Mu(:,:,i) = Mu(:,:,i)' * Mu(:,:,i);    
+    plotGMM2([50; 0], Mu(:,:,i), [.6 .6 .6], .1);
+end
+ylabel('$\mathbf{K}^p$', 'Interpreter', 'Latex', 'Fontsize', 10);
+axis equal;xlim([-25, 75]); ylim([-25, 25]);
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting demonstrated Stiffness and GMM centers on CHOL over time
+subplot(3,2,[3 4]); hold on;
+title('\fontsize{10}Demonstrated Stiffness and GMM centers');
+sc = 1/modelCHOL.dt;
+for i=1:size(DataK,2)
+	Mu(:,:,i) = zeros(2,2);             Mu(1,1,i) = DataK(4,i);
+    Mu(1,2,i) = DataK(5,i);             Mu(2,2,i) = DataK(6,i);
+    % Reconstructing stiffness matrix from Cholesky decomposition
+    % Kp = k' * k
+    Mu(:,:,i) = Mu(:,:,i)' * Mu(:,:,i);    
+    plotGMM2([DataK(1,i)*sc; 0], Mu(:,:,i), [.6 .6 .6], .1);
+end
+for i=1:modelCHOL.nbStates
+    Mu(:,:,i) = zeros(2,2);             Mu(1,1,i) = modelCHOL.Mu(4,i);
+    Mu(1,2,i) = modelCHOL.Mu(5,i);      Mu(2,2,i) = modelCHOL.Mu(6,i);
+    Mu(:,:,i) = Mu(:,:,i)' * Mu(:,:,i);    
+    plotGMM2([modelCHOL.Mu(1,i)*sc; 0], Mu(:,:,i), ...
+        clrmapMAN_states(i,:), .3);
+end
+ylabel('$\mathbf{K}^p$', 'Interpreter', 'Latex', 'Fontsize', 10);
+xlabel('$t$', 'Fontsize', 10, 'Interpreter', 'Latex');
+xlim([-27, xIn(end)*sc+10]); ylim([-27, 27]);
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+
+%% Reproduction: CHOLesky decomposition
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+if ~LOAD_TOY_EX_DATA
+    in     = 1:3;   % Input variables
+    out    = 4:6;   % Output variables
+    tic;
+    for j = reprosCHOL
+        tmpModel(j) = GMR(model_r,[time(1:(nbData-rdp)); ...
+            dD(j).avgFe(:,rdp+1:end)],in, out);         % Eq. (7)
+    end
+    elapsed_t_CHOL(2) = toc/length(reprosCHOL);
+end
+%% Plotting results from GMR on CHOLesky decomposition
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting desired Stiffness profile (GMR on CHOL)
+figure(handel_GMM_GMR_CHOL);
+subplot(3,2,5); hold on;
+title('\fontsize{10}Desired Stiffness profile');
+for j = reprosCHOL
+    for i=round(linspace(1,nbData-rdp,50))
+        Mu(:,:,i) = zeros(2,2);           Mu(1,1,i) = tmpModel(j).Mu(1,i);
+        Mu(1,2,i) = tmpModel(j).Mu(2,i);  Mu(2,2,i) = tmpModel(j).Mu(3,i);
+        % Reconstructing stiffness matrix from Cholesky decomposition
+        % Kp = k' * k
+        Mu(:,:,i) = Mu(:,:,i)' * Mu(:,:,i);    
+        plotGMM2([DataK(1,i)*sc; 0], Mu(:,:,i), [0 1 0], .3);
+    end
+end
+for j = reprosCHOL
+    l=1;
+    for i=round(linspace(3,nbData-rdp,5))
+        Mu(:,:,i) = dD(j).KP(:,:,i);    
+        plotGMM2([DataK(1,i)*sc; 0], Mu(:,:,i), [1 1 0.5], .5);
+        l=l+1;
+    end
+end
+ylabel('$\mathbf{\hat{K}}^p$', 'Fontsize', 10, 'Interpreter', 'Latex');
+xlabel('$t$', 'Fontsize', 10, 'Interpreter', 'Latex');
+axis([-25, DataK(1,end)*sc+10, -25, 25]);
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Plotting states influence during GMR estimation
+subplot(3,2,6); hold on;  
+title('\fontsize{10}Influence of GMM components');
+for i=1:modelPD.nbStates
+    plot(xIn*50, tmpModel(j).H(i,:), 'linewidth', 2, 'color', ...
+        clrmapMAN_states(i,:));
+end
+axis([xIn(1), xIn(end)*50, 0, 1.02]);
+xlabel('$t$', 'Fontsize', 10, 'Interpreter', 'Latex');
+ylabel('$h_k$', 'Fontsize', 10, 'Interpreter', 'Latex');
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+print(handel_GMM_GMR_CHOL,'-depsc2','-r300',['fig_GMM_GMR_CHOL']);
+
+%% Computing the trajectory of the mass from the learned stiff.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+figure(reproduction);
+for j=6%reprosCHOL
+    m1=1;dt=0.02;xr=[];
+    xR1  = g;
+    x1(:,1)   = xR1;
+    dx1(:,1)  = zeros(2,1);
+    ddx1(:,1) = zeros(2,1);
+    f1 = zeros(2,1);
+    Fe = dD(j).avgFe;
+    for i = 2:nbData-rdp
+        Mu(:,:,i) = zeros(2,2);         Mu(1,1,i) = tmpModel(j).Mu(1,i);
+        Mu(1,2,i) = tmpModel(j).Mu(2,i);  Mu(2,2,i) = tmpModel(j).Mu(3,i);
+        k1 = Mu(:,:,i)' * Mu(:,:,i);
+        f1(:,i-1) = k1 * ( x1(:,i-1) - xR1 );
+        ddx1(:,i) = (Fe(:,i-1) - f1(:,i-1) - D * dx1(:,i-1)) / m1;
+        dx1(:,i)  = dx1(:,i-1) + ddx1(:,i) * dt;
+        x1(:,i) = x1(:,i-1) + dx1(:,i) * dt;
+    end
+    n=1;
+    for i = round(linspace(2,nbData-2,30))
+        x1x(:,n) = x1(:,i);
+        n = n+1;
+    end
+    plot(x1x(1,:),x1x(2,:),'b--o');
+end
+%% Plotting resulting model and reproductions
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+for j = reprosCHOL
+    if j==reprosCHOL(1)
+        cnt = 1;        b = round(linspace(1,(nbData-rdp),10));
+    end
+    for i = 1:(nbData-rdp)
+        Kpt = (triu(ones(2)));                   
+        Kpt(logical(Kpt)) = tmpModel(j).Mu(1:3,i);
+        K_l = Kpt' * Kpt;                   dD(j).K_l(:,:,i) = K_l;
+        
+        K_o = dD(j).KO(:,:,i+rdp);
+%         K_o = zeros(2,2);
+%         K_o(1,1) = dD(j).KXX(i+rdp);    K_o(1,2) = dD(j).KXY(i+rdp);
+%         K_o(2,1) = dD(j).KYX(i+rdp);    K_o(2,2) = dD(j).KYY(i+rdp);
+        % The average distances between the ground truth stiffness and the
+        % resulting stiffness from GMR on Cholesky decomposition
+        % Four metric methods are used here.
+        % (1) Cholesky-Frobenius
+        chol_error(i,j) = cholesky_dist(K_o,K_l);
+        % (2) the log-Euclidean
+        Log_Euclidean(i,j) = Log_Euclidean_dist(K_l,K_o);
+        % (3) the affine-invariant
+        Affine_Invariant(i,j) = Affine_invariant_dist(K_l,K_o);
+        % (4) Jensen-Bregman log-determinant
+        Log_Determinant(i,j) = Log_Determinant_dist(K_l,K_o);
+        %end
+    end
+    
+    chol_e(j) = mean(chol_error(:,j).^2);       bar1_chol(cnt) = chol_e(j);
+    logE_e(j) = mean(Log_Euclidean(:,j).^2);    bar2_chol(cnt) = logE_e(j);
+    AffI_e(j) = mean(Affine_Invariant(:,j).^2); bar3_chol(cnt) = AffI_e(j);
+    logD_e(j) = mean(Log_Determinant(:,j).^2);  bar4_chol(cnt) = logD_e(j);
+    
+    chol_s(j) = std(chol_error(:,j).^2);       bar1_chol_s(cnt) = chol_s(j);
+    logE_s(j) = std(Log_Euclidean(:,j).^2);    bar2_chol_s(cnt) = logE_s(j);
+    AffI_s(j) = std(Affine_Invariant(:,j).^2); bar3_chol_s(cnt) = AffI_s(j);
+    logD_s(j) = std(Log_Determinant(:,j).^2);  bar4_chol_s(cnt) = logD_s(j);
+    cnt = cnt + 1;
+end
+
+%% Learning: GMM on SPD Manifolds
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+if ~LOAD_TOY_EX_DATA
+    % Initialisation of the covariance transformation for GMM over man. ellips.
+    [covOrder4to2, covOrder2to4] = set_covOrder4to2(modelPD.nbVar);
+    
+    disp('Learning GMM2 (K ellipsoids)...');
+    in     = 1:3;               % Input variables
+    out    = 4:modelPD.nbVar;	% Output variables
+    
+    tic;
+    % GMM initialisation on the manifold - Eq. (12)
+    modelPD = spd_init_GMM_kbins(X, modelPD, modelPD.nbSamples);
+    [modelPD, GAMMA, L] = spd_EM_GMM(X, modelPD, (nbData-rdp),in,out);
+    elapsed_t_Man(1) = toc;
+end
+%% Plotting results from GMM on SPD Manifolds
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting Demonstrated Stiffness
+handel_GMM_GMR_SPD = figure;%('position',[2000,6000,600,450]); hold on;
+htt = subplot(4,2,1:2); hold on; 
+t1 = title('\fontsize{10}GMM/GMR based on Riemannian manifold');
+set(htt(1), 'position', [0.1300 0.95,0.7750, .0] );
+htt.Visible = 'off';t1.Visible = 'on';
+
+subplot(3,2,1); hold on;
+%title('Demonstrated Stiffness', 'Interpreter', 'Latex', 'Fontsize', 12);
+for n=1:modelPD.nbSamples
+    for i=round(linspace(1,(nbData-rdp),10))
+        plotGMM2([i;0], X(4:5,4:5,i+(n-1)*(nbData-rdp)), clrmap_demos(n,:), .4);
+    end
+end
+xlim([-27, (nbData-rdp)+10]); ylim([-27, 27]);
+ylabel('$\mathbf{\tilde{K}}^\mathcal{P}$', 'Interpreter', 'Latex', 'Fontsize', 11);
+xlabel('$t$', 'Fontsize', 10, 'Interpreter', 'Latex');
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting GMM centers on SPD manifold.
+subplot(3,2,2); hold on;
+%title('Rotation of GMM centers on $\mathcal{S}_+^{m}$', 'Interpreter', 'Latex', 'Fontsize', 12);
+for i=1:modelPD.nbStates % Plotting GMM of man. ellipsoids
+    [h, ~] = plotGMM2([0; 0], modelPD.MuMan(out,out,i), ...
+        clrmapMAN_states(i,:), .3); hh{i} = h(1);
+end
+% for i=round(linspace(nbData,2*nbData,20))
+%         Mu(:,:,i) = zeros(2,2);         Mu(1,1,i) = DataK(4,i);
+%         Mu(1,2,i) = DataK(5,i);  Mu(2,2,i) = DataK(6,i);
+%         Mu(:,:,i) = Mu(:,:,i)' * Mu(:,:,i);    
+%     plotGMM2([50; 0], Mu(:,:,i), [.6 .6 .6], .1);
+% end
+xlabel('$x$', 'Fontsize', 11, 'Interpreter', 'Latex');
+ylabel('$y$', 'Fontsize', 11, 'Interpreter', 'Latex');
+axis equal; xlim([-25, 25]); ylim([-25, 25]);
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting Demonstrated Stiffness and GMM centers on SPD manifold over time.
+subplot(3,2,[3 4]); hold on;
+%title('Demonstrated Stiffness and GMM centers on $\mathcal{S}_+^{m}$', 'Interpreter', 'Latex', 'Fontsize', 12);
+sc = 1/modelPD.dt;
+for i=1:size(X,3) % Plotting man. ellipsoids from demonstration data
+    plotGMM2([X(1,1,i)*sc; 0], X(out,out,i), [.6 .6 .6], .1);
+end
+for i=1:modelPD.nbStates % Plotting GMM of man. ellipsoids
+    plotGMM2([modelPD.MuMan(1,1,i)*sc; 0], modelPD.MuMan(out,out,i), ...
+        clrmapMAN_states(i,:), .3);
+end
+xlim([-27, (nbData-rdp)+10]); ylim([-27, 27]);
+ylabel('$\mathbf{\tilde{K}}^\mathcal{P}$', 'Interpreter', 'Latex', 'Fontsize', 11);
+xlabel('$t$', 'Fontsize', 10, 'Interpreter', 'Latex');
+set(gca, 'FontSize', 10,'TickLabelInterpreter','latex');
+
+%% GMR (version with single optimization loop)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+if ~LOAD_TOY_EX_DATA
+    disp('Regression...');
+    xInSPD = zeros(3,3,(nbData-rdp));
+    xInSPD(1,1,:) = reshape(repmat(xIn,1,1),1,1,(nbData-rdp));
+    %in     = 2:3;%
+    tic;
+    for j = reprosMan
+        for i=1:(nbData-rdp)
+            xInSPD(2,2,i) = dD(j).avgFe(1,i+rdp);
+            xInSPD(3,3,i) = dD(j).avgFe(2,i+rdp);
+        end
+        newModelPD(j) = spd_GMR(modelPD, xInSPD, in, out);  % Eq. (19)
+    end
+    elapsed_t_Man(2) = toc/length(reprosMan);
+end
+%% Plotting results from GMR on SPD manifold
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ploting desired Stiffness ellipsoids (GMR on SPD)
+figure(handel_GMM_GMR_SPD);
+subplot(3,2,5); hold on;
+%title('Desired Stiffness profile (GMR on $\mathcal{S}_+^{m}$)', 'Interpreter', 'Latex', 'Fontsize', 12);
+for j = 6%reprosMan
+    for i=round(linspace(1,nbData-rdp,50))
+        plotGMM2([xInSPD(1,1,i)*sc; 0], newModelPD(j).Mu(:,:,i), [0.2 0.8 0.2], .4);
+    end
+end
+set(gca, 'FontSize', 8);
+ylabel('$\mathbf{\hat{K}}^\mathcal{P}$', 'Fontsize', 11, 'Interpreter', 'Latex');
+xlabel('$t$', 'Fontsize', 11, 'Interpreter', 'Latex');
+axis([-25, DataK(1,end)*sc+10, -25, 25]);
+% Plotting estimated stiffness ellipsoid
+for j = 6
+    for i=round(linspace(3,nbData-rdp,5)) 
+        Mu(:,:,i) = dD(j).KP(:,:,i);    
+        plotGMM2([DataK(1,i)*sc; 0], Mu(:,:,i), [0.8 0.2 0.2], .4);
+    end
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Plotting states influence during GMR estimation
+subplot(3,2,6); hold on;
+%title('Influence of GMM components', 'Interpreter', 'Latex', 'Fontsize', 12);
+for i=1:modelPD.nbStates
+    plot(xIn*50, newModelPD(j).H(i,:),'linewidth',2,'color',clrmapMAN_states(i,:));
+end
+axis([0, 100, 0, 1.02]);
+set(gca, 'FontSize', 8)
+xlabel('$t$', 'Fontsize', 11, 'Interpreter', 'Latex');
+ylabel('$h_k$', 'Fontsize', 11, 'Interpreter', 'Latex');
+print(handel_GMM_GMR_SPD,'-depsc2','-r300',['fig_GMM_GMR_SPD']);
+print(handel_GMM_GMR_SPD,'-dpng','-r300',['fig_GMM_GMR_SPD']);
+
+%% Computing the trajectory of the mass from the learned stiff.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+figure(reproduction);
+for j=6%reprosMan
+    m1=1;dt=0.02;xr=[];
+    xR1  = g;
+    x1(:,1)   = xR1;
+    dx1(:,1)  = zeros(2,1);
+    ddx1(:,1) = zeros(2,1);
+    f1 = zeros(2,1);
+    Fe = dD(j).avgFe;
+    for i = 2:nbData-rdp
+        k1 = newModelPD(j).Mu(:,:,i);
+        f1(:,i-1) = k1 * ( x1(:,i-1) - xR1 );
+        ddx1(:,i) = (Fe(:,i-1) - f1(:,i-1) - D * dx1(:,i-1)) / m1;
+        dx1(:,i)  = dx1(:,i-1) + ddx1(:,i) * dt;
+        x1(:,i) = x1(:,i-1) + dx1(:,i) * dt;
+    end
+    n=1;
+    for i = round(linspace(2,nbData-2,30))
+        x1x(:,n) = x1(:,i);
+        n = n+1;
+    end
+    plot(x1x(1,:),x1x(2,:),'--rs','MarkerSize',10);
+end
+print(reproduction,'-depsc2','-r300',['fig_reproduction']);
+%% Plotting resulting model and reproductions
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+for j = reprosMan
+    if j==reprosMan(1),  cnt = 1;  b = round(linspace(1,(nbData-rdp),10));
+    end
+    for i = 1:(nbData-rdp)
+        K_l = newModelPD(j).Mu(:,:,i);    dD(j).K_l(:,:,i) = K_l;
+        
+        K_o = dD(j).KO(:,:,i+rdp);
+
+        chol_error(i,j) = cholesky_dist(K_o,K_l);
+        Log_Euclidean(i,j) = Log_Euclidean_dist(K_l,K_o);
+        Affine_Invariant(i,j) = Affine_invariant_dist(K_l,K_o);
+        Log_Determinant(i,j) = Log_Determinant_dist(K_l,K_o);
+    end
+    
+    chol_e(j) = mean(chol_error(:,j).^2);       bar1_man(cnt) = chol_e(j);
+    logE_e(j) = mean(Log_Euclidean(:,j).^2);    bar2_man(cnt) = logE_e(j);
+    AffI_e(j) = mean(Affine_Invariant(:,j).^2); bar3_man(cnt) = AffI_e(j);
+    logD_e(j) = mean(Log_Determinant(:,j).^2);  bar4_man(cnt) = logD_e(j);
+    
+    chol_s(j) = std(chol_error(:,j).^2);       bar1_man_s(cnt) = chol_s(j);
+    logE_s(j) = std(Log_Euclidean(:,j).^2);    bar2_man_s(cnt) = logE_s(j);
+    AffI_s(j) = std(Affine_Invariant(:,j).^2); bar3_man_s(cnt) = AffI_s(j);
+    logD_s(j) = std(Log_Determinant(:,j).^2);  bar4_man_s(cnt) = logD_s(j);
+    cnt = cnt + 1;
+end
+
+%% Plot bar with barerror
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+colorss = lines(modelCHOL.nbStates);
+% means
+model_series = [
+    mean(bar2_chol) mean(bar2_man);
+    mean(bar3_chol) mean(bar3_man); 
+    mean(bar4_chol) mean(bar4_man)];
+% standard deviation
+model_error = [
+    std(bar2_chol) std(bar2_man);
+    std(bar3_chol) std(bar3_man); 
+    std(bar4_chol) std(bar4_man)];
+% Creating axes and the bar graph
+handel_bar = figure('position',[1000,500,450,110]);ax = axes;
+h = bar(model_series,'BarWidth',1);
+% Set color for each bar face
+h(1).FaceColor = colorss(1,:);
+h(2).FaceColor = colorss(2,:);
+% Properties of the bar graph as required
+ax.YGrid = 'on';
+ax.GridLineStyle = '-';
+xticks(ax,[1 2 3]);
+% Naming each of the bar groups
+xticklabels(ax,{ 'Log Euclidean';'Affine invariant';'Log Determinant'});
+% Y labels
+ylabel ('dist. error', 'Fontsize', 12, 'Interpreter', 'Latex');
+% Creating a legend and placing it outside the bar plot
+lg = legend('GMR on Chol.','GMR on $\bf{\mathcal{S}}_+^{m}$','AutoUpdate','off');
+set(lg, 'Fontsize', 12, 'Interpreter', 'Latex');
+
+hold on;
+% Finding the number of groups and the number of bars in each group
+ngroups = size(model_series, 1);
+nbars = size(model_series, 2);
+% Calculating the width for each bar group
+groupwidth = min(0.8, nbars/(nbars + 1.5));
+% Set the position of each error bar in the centre of the main bar
+% Based on barweb.m by Bolu Ajiboye from MATLAB File Exchange
+for i = 1:nbars
+    % Calculate center of each bar
+	x = (1:ngroups) - groupwidth/2 + (2*i-1) * groupwidth / (2*nbars);
+    errorbar(x, model_series(:,i), model_error(:,i), 'k', 'linestyle', 'none');
+end
+handel_bar.CurrentAxes.TickLabelInterpreter = 'latex';
+ylim([0, max(max(model_series))+2*max(max(model_error))]);
+set(ax, 'Fontsize', 12)
+%print(handel_bar,'-depsc2','-r300',['fig_gmr_dist_chol_man']);
+
